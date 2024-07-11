@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <time.h>
 #include <unistd.h>
+#include <string.h>
 
 uint64_t time_diff(struct timespec *start, struct timespec *end) {
   return (end->tv_sec - start->tv_sec) * 1000000000 +
@@ -24,8 +25,15 @@ void test_pread_seq_full(const std::string &file_path, int thread_num,
 
   struct timespec start, end;
   clock_gettime(CLOCK_MONOTONIC_RAW, &start);
-  if (pread(fd, buf, file_size, 0) == -1) {
-    printf("error\n");
+  auto read_buffer = buf;
+  auto bytes_left = file_size;
+  while (bytes_left > 0) {
+    auto trans = read(fd, read_buffer, bytes_left);
+    if (trans == -1) {
+      std::cout << "ERROR: " << strerror(errno);
+    }
+    read_buffer += trans;
+    bytes_left -= trans;
   }
 
   clock_gettime(CLOCK_MONOTONIC_RAW, &end);
@@ -89,7 +97,7 @@ void test_pread_randread(const std::string &file_path, int thread_num,
 
   int fd = open(file_path.c_str(), O_RDONLY | O_DIRECT);
 
-  int num_read = 2000;
+  int num_read = 1000000;
   size_t buf_size = block_size * num_read;
   char *buf = (char *)aligned_alloc(block_size, buf_size);
   // std::cout << block_size / 1024 << "KB " << std::endl;

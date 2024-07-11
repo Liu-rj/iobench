@@ -7,12 +7,46 @@
 #include <string.h>
 #include <unistd.h>
 #include <vector>
+#include <fstream>
+#include <omp.h>
+#include <array>
 
 #define BUFFER_SIZE 4096
+#define NUM_RING 4
+#define RING_LEN 1024
 
 uint64_t time_diff(struct timespec *start, struct timespec *end) {
   return (end->tv_sec - start->tv_sec) * 1000000000 +
          (end->tv_nsec - start->tv_nsec);
+}
+
+struct IOUringState {
+  std::array<io_uring, NUM_RING> ring_arr;
+
+  static IOUringState *Global() {
+    static IOUringState state;
+    return &state;
+  }
+};
+
+void Init_iouring() {
+  auto* uring_state = IOUringState::Global();
+  auto& ring_arr = uring_state->ring_arr;
+
+  for (int i = 0; i < NUM_RING; i++) {
+    int ret = io_uring_queue_init(RING_LEN, &ring_arr[i], 0);
+    if (ret) {
+      std::cout << "Unable to setup io_uring: " << strerror(-ret);
+    }
+  }
+}
+
+void Exit_iouring() {
+  auto* uring_state = IOUringState::Global();
+
+  for (int i = 0; i < NUM_RING; i++) {
+    io_uring_queue_exit(&uring_state->ring_arr[i]);
+  }
 }
 
 struct IoContext {
@@ -94,15 +128,97 @@ void io_uring(const std::string &file_path, int thread_num) {
   free(buffer);
 }
 
-int main(int argc, char *argv[]) {
-  if (argc != 3) {
-    std::cerr << "Usage: " << argv[0] << "<filename> <thread_num>" << std::endl;
+void test_iouring_randread(const std::string &file_path, int thread_num,
+                         uint32_t block_size) {
+  std::ifstream is(file_path, std::ifstream::binary | std::ifstream::ate);
+  std::size_t file_size = is.tellg();
+  is.close();
+
+  int fd = open(file_path.c_str(), O_RDONLY | O_DIRECT);
+
+  int num_read = 1000000;
+  size_t buf_size = block_size * num_read;
+  char *buf = (char *)aligned_alloc(block_size, buf_size);
+  // std::cout << block_size / 1024 << "KB " << std::endl;
+  auto num_blocks = file_size / block_size;
+  int offset[num_read];
+  for (int i = 0; i < num_read; i++) {
+    offset[i] = rand() % num_blocks;
   }
 
-  const std::string filename = argv[1];
-  int t = atoi(argv[2]);
+  Init_iouring();
+  auto* uring_state = IOUringState::Global();
+  auto& ring_arr = uring_state->ring_arr;
 
-  io_uring(filename, t);
+  struct timespec start, end;
+  clock_gettime(CLOCK_MONOTONIC_RAW, &start);
+
+#pragma omp parallel for num_threads(NUM_RING)
+  for (int i = 0; i < num_read; i += RING_LEN) {
+    int thd_id = omp_get_thread_num();
+    auto& ring = ring_arr[thd_id];
+
+    int r = std::min(num_read, i + RING_LEN);
+    struct io_uring_sqe* sqe;
+    for (int j = i; j < r; j++) {
+      sqe = io_uring_get_sqe(&ring);
+      if (!sqe) {
+        std::cout << "Could not get SQE."
+                   << " i: " << i << " j: " << j;
+      }
+      io_uring_prep_read(sqe, fd, buf + j * block_size,
+                         block_size, offset[j] * block_size);
+      if ((j + 1) % 64 == 0 || j == r - 1) {
+        io_uring_submit(&ring);
+      }
+    }
+
+    int finish_num = 0;
+    while (finish_num < r - i) {
+      struct io_uring_cqe* cqe;
+      int ret = io_uring_wait_cqe(&ring, &cqe);
+      if (ret < 0) {
+        std::cout << "Error waiting for completion: " << strerror(-ret);
+      }
+      struct io_uring_cqe* cqes[RING_LEN];
+      int cqecount = io_uring_peek_batch_cqe(&ring, cqes, RING_LEN);
+      if (cqecount == -1) {
+        std::cout << "Error peeking batch data";
+      }
+      io_uring_cq_advance(&ring, cqecount);
+      finish_num += cqecount;
+    }
+  }
+
+  clock_gettime(CLOCK_MONOTONIC_RAW, &end);
+  Exit_iouring();
+  auto duration = time_diff(&start, &end) / 1000000.0;
+  uint64_t bandwidth = (buf_size / (1024 * 1024)) / (duration / 1000);
+  uint64_t *array = (uint64_t *)buf;
+  uint64_t sum = 0;
+  for (int i = 0; i < buf_size / sizeof(uint64_t); ++i) {
+    sum ^= array[i];
+  }
+  printf("%lu, %.3fms, %luMB/s\n", sum, duration, bandwidth);
+  free(buf);
+  close(fd);
+}
+
+int main(int argc, char *argv[]) {
+  if (argc != 5) {
+    std::cerr << "Usage: " << argv[0]
+              << "<filename> <is_random>  <thread_num> <block_size KB>"
+              << std::endl;
+  }
+  const std::string filename = argv[1];
+  int rand = atoi(argv[2]);
+  int t = atoi(argv[3]);
+  int block = atoi(argv[4]) * 1024;
+  if (rand) {
+    test_iouring_randread(filename, t, block);
+  } else {
+    std::cout << "Not implemented\n";
+  }
 
   return 0;
 }
