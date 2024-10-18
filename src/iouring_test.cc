@@ -137,7 +137,7 @@ void test_iouring_randread(const std::string &file_path, int thread_num,
   int fd = open(file_path.c_str(), O_RDONLY | O_DIRECT);
 
   int num_read = 1000000;
-  size_t buf_size = block_size * num_read;
+  auto buf_size = static_cast<size_t>(block_size) * num_read;
   char *buf = (char *)aligned_alloc(block_size, buf_size);
   // std::cout << block_size / 1024 << "KB " << std::endl;
   auto num_blocks = file_size / block_size;
